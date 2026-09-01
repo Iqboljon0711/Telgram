@@ -24,6 +24,10 @@ TOPSMM_API_KEY = os.environ["TOPSMM_API_KEY"]
 TOPSMM_URL = os.environ.get("TOPSMM_URL", "https://topsmm.uz/api/v2")
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 MARKUP_MULTIPLIER = float(os.environ.get("MARKUP_MULTIPLIER", "1.25"))
+# gemini-2.5-flash was retired by Google ahead of schedule (404 NOT_FOUND).
+# Current model as of Sep 2026: gemini-3.7-flash. Configurable via .env so a
+# future Google renaming doesn't require editing this file again.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
 SERVICES_CACHE_TTL = 300  # seconds
 
 logging.basicConfig(level=logging.INFO)
@@ -222,7 +226,7 @@ Mavjud xizmatlar:
     try:
         response = await asyncio.to_thread(
             genai_client.models.generate_content,
-            model="gemini-2.5-flash",
+            model=GEMINI_MODEL,
             contents=prompt,
         )
         ai_response = (response.text or "").strip()
