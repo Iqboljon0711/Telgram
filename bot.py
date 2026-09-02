@@ -38,6 +38,8 @@ RUB_TO_UZS_RATE = float(os.environ.get("RUB_TO_UZS_RATE", "135"))
 ADMIN_IDS = {
     int(x) for x in os.environ.get("ADMIN_IDS", os.environ.get("ADMIN_ID", "")).split(",") if x.strip()
 }
+# To'lov uchun foydalanuvchiga ko'rsatiladigan admin username (@ belgisiz yozing, .env da).
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "").lstrip("@")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -181,8 +183,9 @@ async def topup_start(callback: types.CallbackQuery, state: FSMContext):
         )
         await callback.answer()
         return
+    contact_hint = f" (to'lov rekvizitlari uchun @{ADMIN_USERNAME} bilan bog'lanasiz)" if ADMIN_USERNAME else ""
     await callback.message.answer(
-        "💳 Balansni qancha so'mga to'ldirmoqchisiz? Miqdorni raqamda yozing.\n"
+        f"💳 Balansni qancha so'mga to'ldirmoqchisiz{contact_hint}? Miqdorni raqamda yozing.\n"
         "To'lovni admin tekshirib, tasdiqlagach balansingizga tushadi.\n"
         "Bekor qilish uchun /cancel yozing."
     )
@@ -206,9 +209,14 @@ async def process_topup_amount(message: types.Message, state: FSMContext):
         "username": user.username or user.full_name,
     }
 
+    if ADMIN_USERNAME:
+        contact_line = f"Karta raqami va to'lov rekvizitlari uchun @{ADMIN_USERNAME} ga yozing."
+    else:
+        contact_line = "Karta raqami va to'lov rekvizitlari uchun admin bilan bog'laning."
+
     await message.answer(
         "✅ So'rovingiz adminga yuborildi. Tasdiqlangach balansingizga mablag' tushadi.\n"
-        "Karta raqami va to'lov rekvizitlari uchun admin bilan bog'laning.",
+        f"{contact_line}",
         reply_markup=main_menu_keyboard(),
     )
     await state.clear()
