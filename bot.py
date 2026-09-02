@@ -30,6 +30,15 @@ MARKUP_MULTIPLIER = float(os.environ.get("MARKUP_MULTIPLIER", "1.25"))
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
 SERVICES_CACHE_TTL = 300  # seconds
 
+# TopSMM narxlari RUB da qaytadi. Fix kurs bilan so'mga o'giramiz.
+# Kursni yangilash uchun .env dagi RUB_TO_UZS_RATE ni tahrirlang.
+RUB_TO_UZS_RATE = float(os.environ.get("RUB_TO_UZS_RATE", "135"))
+
+# Balansni to'ldirish so'rovlari shu admin(lar)ga yuboriladi (Telegram user id).
+ADMIN_IDS = {
+    int(x) for x in os.environ.get("ADMIN_IDS", os.environ.get("ADMIN_ID", "")).split(",") if x.strip()
+}
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -37,9 +46,12 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# In-memory caches (fine for a single-process bot; use Redis if you scale out)
+# In-memory caches (fine for a single-process bot; use Redis/DB if you scale
+# out or need the data to survive a restart).
 _services_cache: dict = {"data": [], "fetched_at": 0}
 _category_lookup: dict[str, str] = {}   # short id -> full category name
+_user_balances: dict[int, float] = {}   # user_id -> balans (so'm)
+_pending_topups: dict[str, dict] = {}   # topup_id -> {user_id, amount, username}
 
 
 class OrderState(StatesGroup):
@@ -47,6 +59,7 @@ class OrderState(StatesGroup):
     waiting_for_link = State()
     waiting_for_quantity = State()
     waiting_for_confirm = State()
+    waiting_for_topup_amount = State()
 
 
 def short_id(text: str) -> str:
@@ -54,8 +67,15 @@ def short_id(text: str) -> str:
     return format(zlib.crc32(text.encode("utf-8")) & 0xFFFFFFFF, "x")
 
 
+def get_balance(user_id: int) -> float:
+    return _user_balances.get(user_id, 0.0)
+
+
 async def fetch_services(session: aiohttp.ClientSession, force: bool = False) -> list:
-    """Fetch services from TopSMM with a markup applied, cached for SERVICES_CACHE_TTL seconds."""
+    """Fetch services from TopSMM (rates in RUB), convert to so'm and apply markup.
+
+    Cached for SERVICES_CACHE_TTL seconds.
+    """
     now = time.time()
     if not force and _services_cache["data"] and now - _services_cache["fetched_at"] < SERVICES_CACHE_TTL:
         return _services_cache["data"]
@@ -74,10 +94,11 @@ async def fetch_services(session: aiohttp.ClientSession, force: bool = False) ->
 
     for service in services:
         try:
-            base_rate = float(service.get("rate", 0))
+            base_rate_rub = float(service.get("rate", 0))
         except (TypeError, ValueError):
-            base_rate = 0.0
-        service["rate"] = round(base_rate * MARKUP_MULTIPLIER, 2)
+            base_rate_rub = 0.0
+        # RUB -> UZS, keyin markup qo'shiladi. Natija "1000 ta narxi, so'm".
+        service["rate"] = round(base_rate_rub * RUB_TO_UZS_RATE * MARKUP_MULTIPLIER, 2)
 
     _services_cache["data"] = services
     _services_cache["fetched_at"] = now
@@ -105,6 +126,16 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="📂 Kategoriyalar bo'yicha", callback_data="show_categories")],
             [InlineKeyboardButton(text="🔍 AI yordamida qidirish", callback_data="ai_search_prompt")],
+            [InlineKeyboardButton(text="💰 Balans", callback_data="show_balance")],
+        ]
+    )
+
+
+def balance_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Balansni to'ldirish", callback_data="topup_start")],
+            [InlineKeyboardButton(text="🔙 Asosiy menyu", callback_data="back_home")],
         ]
     )
 
@@ -126,6 +157,118 @@ async def cmd_cancel(message: types.Message, state: FSMContext):
         return
     await state.clear()
     await message.answer("❎ Bekor qilindi.", reply_markup=main_menu_keyboard())
+
+
+@dp.message(Command("balance"))
+async def cmd_balance(message: types.Message):
+    bal = get_balance(message.from_user.id)
+    await message.answer(f"💰 Joriy balansingiz: {bal:.2f} so'm", reply_markup=balance_keyboard())
+
+
+@dp.callback_query(F.data == "show_balance")
+async def show_balance(callback: types.CallbackQuery):
+    bal = get_balance(callback.from_user.id)
+    await callback.message.answer(f"💰 Joriy balansingiz: {bal:.2f} so'm", reply_markup=balance_keyboard())
+    await callback.answer()
+
+
+# --- BALANSNI TO'LDIRISH (admin tomonidan qo'lda tasdiqlanadi) ---
+@dp.callback_query(F.data == "topup_start")
+async def topup_start(callback: types.CallbackQuery, state: FSMContext):
+    if not ADMIN_IDS:
+        await callback.message.answer(
+            "⚠️ To'lov tizimi hozircha sozlanmagan (admin belgilanmagan). Iltimos, keyinroq urinib ko'ring."
+        )
+        await callback.answer()
+        return
+    await callback.message.answer(
+        "💳 Balansni qancha so'mga to'ldirmoqchisiz? Miqdorni raqamda yozing.\n"
+        "To'lovni admin tekshirib, tasdiqlagach balansingizga tushadi.\n"
+        "Bekor qilish uchun /cancel yozing."
+    )
+    await state.set_state(OrderState.waiting_for_topup_amount)
+    await callback.answer()
+
+
+@dp.message(OrderState.waiting_for_topup_amount)
+async def process_topup_amount(message: types.Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text.isdigit() or int(text) <= 0:
+        await message.answer("Iltimos, musbat raqam kiriting (masalan: 50000).")
+        return
+
+    amount = float(text)
+    user = message.from_user
+    topup_id = short_id(f"{user.id}-{time.time()}")
+    _pending_topups[topup_id] = {
+        "user_id": user.id,
+        "amount": amount,
+        "username": user.username or user.full_name,
+    }
+
+    await message.answer(
+        "✅ So'rovingiz adminga yuborildi. Tasdiqlangach balansingizga mablag' tushadi.\n"
+        "Karta raqami va to'lov rekvizitlari uchun admin bilan bog'laning.",
+        reply_markup=main_menu_keyboard(),
+    )
+    await state.clear()
+
+    admin_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"topup_ok_{topup_id}"),
+                InlineKeyboardButton(text="❌ Rad etish", callback_data=f"topup_no_{topup_id}"),
+            ]
+        ]
+    )
+    admin_text = (
+        "🆕 Balans to'ldirish so'rovi\n\n"
+        f"Foydalanuvchi: @{_pending_topups[topup_id]['username']} (id: {user.id})\n"
+        f"Miqdor: {amount:.2f} so'm"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, admin_text, reply_markup=admin_keyboard)
+        except Exception:
+            logger.exception("Adminga (%s) xabar yuborib bo'lmadi", admin_id)
+
+
+@dp.callback_query(F.data.startswith("topup_ok_") | F.data.startswith("topup_no_"))
+async def handle_topup_decision(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Bu tugma faqat admin uchun.", show_alert=True)
+        return
+
+    approve = callback.data.startswith("topup_ok_")
+    topup_id = callback.data.split("_", 2)[2]
+    topup = _pending_topups.pop(topup_id, None)
+
+    if topup is None:
+        await callback.answer("Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
+        return
+
+    user_id = topup["user_id"]
+    amount = topup["amount"]
+
+    if approve:
+        _user_balances[user_id] = get_balance(user_id) + amount
+        await callback.message.edit_text(callback.message.text + "\n\n✅ TASDIQLANDI")
+        try:
+            await bot.send_message(
+                user_id,
+                f"✅ Balansingiz {amount:.2f} so'mga to'ldirildi.\n"
+                f"Joriy balans: {get_balance(user_id):.2f} so'm",
+            )
+        except Exception:
+            logger.exception("Foydalanuvchiga (%s) xabar yuborib bo'lmadi", user_id)
+    else:
+        await callback.message.edit_text(callback.message.text + "\n\n❌ RAD ETILDI")
+        try:
+            await bot.send_message(user_id, "❌ Balansni to'ldirish so'rovingiz rad etildi. Admin bilan bog'laning.")
+        except Exception:
+            logger.exception("Foydalanuvchiga (%s) xabar yuborib bo'lmadi", user_id)
+
+    await callback.answer("Ko'rib chiqildi.")
 
 
 # --- KATEGORIYALAR ---
@@ -345,6 +488,19 @@ async def process_quantity(message: types.Message, state: FSMContext):
     est_price = round((data["service_rate"] or 0) * quantity / 1000, 2)
     await state.update_data(quantity=quantity, est_price=est_price)
 
+    balance = get_balance(message.from_user.id)
+    if balance < est_price:
+        await message.answer(
+            "⚠️ Balansingiz yetarli emas.\n\n"
+            f"Kerak: {est_price:.2f} so'm\n"
+            f"Joriy balans: {balance:.2f} so'm\n"
+            f"Yetishmayapti: {est_price - balance:.2f} so'm\n\n"
+            "Avval balansni to'ldiring, keyin buyurtmani qaytadan bering.",
+            reply_markup=balance_keyboard(),
+        )
+        await state.clear()
+        return
+
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="confirm_order")],
@@ -356,7 +512,8 @@ async def process_quantity(message: types.Message, state: FSMContext):
         f"Xizmat: {data['service_name']}\n"
         f"Havola: {data['link']}\n"
         f"Miqdor: {quantity}\n"
-        f"Taxminiy narx: {est_price} so'm\n\n"
+        f"Narx: {est_price:.2f} so'm (balansdan yechiladi)\n"
+        f"Joriy balans: {balance:.2f} so'm\n\n"
         "Tasdiqlaysizmi?",
         reply_markup=keyboard,
     )
@@ -373,15 +530,41 @@ async def cancel_order(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(OrderState.waiting_for_confirm, F.data == "confirm_order")
 async def confirm_order(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
+    user_id = callback.from_user.id
+    est_price = data["est_price"]
+
+    # Balansni yana bir bor tekshiramiz (foydalanuvchi shu orada boshqa
+    # buyurtma bergan yoki balans o'zgargan bo'lishi mumkin) va darhol
+    # yechib qo'yamiz — bu double-spend'ning oldini oladi.
+    balance = get_balance(user_id)
+    if balance < est_price:
+        await callback.message.answer(
+            "⚠️ Balansingiz yetarli emas. Buyurtma bekor qilindi.",
+            reply_markup=balance_keyboard(),
+        )
+        await state.clear()
+        await callback.answer()
+        return
+
+    _user_balances[user_id] = balance - est_price
 
     async with aiohttp.ClientSession() as session:
         result = await create_topsmm_order(session, data["service_id"], data["link"], data["quantity"])
 
     if result and isinstance(result, dict) and "order" in result:
-        await callback.message.answer(f"✅ Buyurtma qabul qilindi! ID raqami: {result['order']}")
+        await callback.message.answer(
+            f"✅ Buyurtma qabul qilindi! ID raqami: {result['order']}\n"
+            f"Balansdan yechildi: {est_price:.2f} so'm\n"
+            f"Qolgan balans: {get_balance(user_id):.2f} so'm"
+        )
     else:
+        # Buyurtma muvaffaqiyatsiz — yechilgan mablag'ni qaytaramiz.
+        _user_balances[user_id] = get_balance(user_id) + est_price
         error_msg = result.get("error", "Noma'lum xatolik") if isinstance(result, dict) else "Ulanish xatosi"
-        await callback.message.answer(f"❌ Xatolik yuz berdi: {error_msg}")
+        await callback.message.answer(
+            f"❌ Xatolik yuz berdi: {error_msg}\n"
+            f"Mablag' balansingizga qaytarildi. Joriy balans: {get_balance(user_id):.2f} so'm"
+        )
 
     await state.clear()
     await callback.answer()
