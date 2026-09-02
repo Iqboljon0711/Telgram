@@ -2,44 +2,35 @@ import asyncio
 import logging
 import os
 import time
-import zlib
-
-import aiohttp
+import requests
+from google import genai
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from dotenv import load_dotenv
-from google import genai
 
-# ---------------------------------------------------------------------------
-# Sozlamalar — SECRETS ARE NEVER HARDCODED. Put them in a local .env file
-# (see .env.example) which must NOT be committed to git or pasted anywhere.
-# ---------------------------------------------------------------------------
-load_dotenv()
-
+# ============ SOZLAMALAR ============
+# Barcha maxfiy kalitlar Railway "Variables" bo'limidan olinadi.
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 TOPSMM_API_KEY = os.environ["TOPSMM_API_KEY"]
-TOPSMM_URL = os.environ.get("TOPSMM_URL", "https://topsmm.uz/api/v2")
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-MARKUP_MULTIPLIER = float(os.environ.get("MARKUP_MULTIPLIER", "1.25"))
-# gemini-2.5-flash was retired by Google ahead of schedule (404 NOT_FOUND).
-# Current model as of Sep 2026: gemini-3.7-flash. Configurable via .env so a
-# future Google renaming doesn't require editing this file again.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
-SERVICES_CACHE_TTL = 300  # seconds
+TOPSMM_URL = "https://topsmm.uz/api/v2"
+
+# gemini-2.5-flash Google tomonidan butunlay bekor qilingan (404 NOT_FOUND).
+# Hozirgi turg'un (stable) model:
+GEMINI_MODEL = "gemini-3.6-flash"
+
+MARKUP = 1.25  # 25% ustama
+CACHE_TTL = 600  # xizmatlar ro'yxati necha soniya keshda turadi
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
-# In-memory caches (fine for a single-process bot; use Redis if you scale out)
-_services_cache: dict = {"data": [], "fetched_at": 0}
-_category_lookup: dict[str, str] = {}   # short id -> full category name
+_services_cache = {"data": None, "ts": 0}
 
 
 class OrderState(StatesGroup):
@@ -49,42 +40,42 @@ class OrderState(StatesGroup):
     waiting_for_confirm = State()
 
 
-def short_id(text: str) -> str:
-    """Stable short id for callback_data (Telegram limits callback_data to 64 bytes)."""
-    return format(zlib.crc32(text.encode("utf-8")) & 0xFFFFFFFF, "x")
-
-
-async def fetch_services(session: aiohttp.ClientSession, force: bool = False) -> list:
-    """Fetch services from TopSMM with a markup applied, cached for SERVICES_CACHE_TTL seconds."""
+def get_custom_services(force_refresh: bool = False):
+    """Xizmatlar ro'yxatini oladi, 25% ustama qo'shadi, keshlaydi."""
     now = time.time()
-    if not force and _services_cache["data"] and now - _services_cache["fetched_at"] < SERVICES_CACHE_TTL:
-        return _services_cache["data"]
+    if not force_refresh and _services_cache["data"] is not None:
+        if now - _services_cache["ts"] < CACHE_TTL:
+            return _services_cache["data"]
 
     data = {"key": TOPSMM_API_KEY, "action": "services"}
     try:
-        async with session.post(TOPSMM_URL, data=data, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            services = await resp.json(content_type=None)
-    except Exception:
-        logger.exception("Xizmatlarni olishda xatolik")
-        return _services_cache["data"]  # fall back to stale cache rather than nothing
+        response = requests.post(TOPSMM_URL, data=data, timeout=15)
+        services = response.json()
 
-    if not isinstance(services, list):
-        logger.error("Kutilmagan javob formati: %r", services)
-        return _services_cache["data"]
-
-    for service in services:
-        try:
-            base_rate = float(service.get("rate", 0))
-        except (TypeError, ValueError):
-            base_rate = 0.0
-        service["rate"] = round(base_rate * MARKUP_MULTIPLIER, 2)
-
-    _services_cache["data"] = services
-    _services_cache["fetched_at"] = now
-    return services
+        if isinstance(services, list):
+            for service in services:
+                try:
+                    base_rate = float(service.get("rate", 0))
+                except (TypeError, ValueError):
+                    base_rate = 0
+                service["rate"] = round(base_rate * MARKUP, 2)
+            _services_cache["data"] = services
+            _services_cache["ts"] = now
+            return services
+        return []
+    except Exception as e:
+        logging.error(f"Xizmatlarni olishda xatolik: {e}")
+        return _services_cache["data"] or []
 
 
-async def create_topsmm_order(session: aiohttp.ClientSession, service_id: int, link: str, quantity: int) -> dict | None:
+def get_service_by_id(service_id: int):
+    for s in get_custom_services():
+        if int(s.get("service")) == service_id:
+            return s
+    return None
+
+
+def create_topsmm_order(service_id, link, quantity):
     data = {
         "key": TOPSMM_API_KEY,
         "action": "add",
@@ -93,11 +84,19 @@ async def create_topsmm_order(session: aiohttp.ClientSession, service_id: int, l
         "quantity": quantity,
     }
     try:
-        async with session.post(TOPSMM_URL, data=data, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            return await resp.json(content_type=None)
-    except Exception:
-        logger.exception("Buyurtma xatosi")
+        response = requests.post(TOPSMM_URL, data=data, timeout=15)
+        return response.json()
+    except Exception as e:
+        logging.error(f"Buyurtma xatosi: {e}")
         return None
+
+
+def service_button(s: dict) -> InlineKeyboardButton:
+    s_id = s.get("service")
+    s_name = s.get("name", "")
+    s_rate = s.get("rate")
+    btn_text = f"{s_name[:25]} (1000 ta) — {s_rate} so'm"
+    return InlineKeyboardButton(text=btn_text[:64], callback_data=f"srv_{s_id}")
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -110,8 +109,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message, state: FSMContext):
-    await state.clear()
+async def cmd_start(message: types.Message):
     await message.answer(
         "Salom! SMM xizmatlari botiga xush kelibsiz.\n"
         "Qanday qilib xizmat topmoqchisiz?",
@@ -119,33 +117,22 @@ async def cmd_start(message: types.Message, state: FSMContext):
     )
 
 
-@dp.message(Command("cancel"))
-async def cmd_cancel(message: types.Message, state: FSMContext):
-    if await state.get_state() is None:
-        await message.answer("Bekor qilinadigan hech narsa yo'q.")
-        return
-    await state.clear()
-    await message.answer("❎ Bekor qilindi.", reply_markup=main_menu_keyboard())
-
-
 # --- KATEGORIYALAR ---
 @dp.callback_query(F.data == "show_categories")
-async def show_categories(callback: types.CallbackQuery, state: FSMContext):
-    async with aiohttp.ClientSession() as session:
-        services = await fetch_services(session)
-
+async def show_categories(callback: types.CallbackQuery):
+    services = get_custom_services()
     if not services:
-        await callback.message.answer("Hozirda xizmatlar topilmadi. Birozdan so'ng qayta urinib ko'ring.")
+        await callback.message.answer("⚠️ Hozirda xizmatlar topilmadi. Birozdan so'ng qayta urinib ko'ring.")
         await callback.answer()
         return
 
-    categories = sorted({s.get("category", "Boshqa") for s in services})
-    keyboard_buttons = []
-    for cat in categories:
-        cid = short_id(cat)
-        _category_lookup[cid] = cat  # exact lookup, no truncation collisions
-        keyboard_buttons.append([InlineKeyboardButton(text=cat[:40], callback_data=f"cat_{cid}")])
+    categories = sorted(set(s.get("category", "Boshqa") for s in services))
+    dp["_categories"] = categories  # indeks orqali murojaat qilish uchun saqlanadi
 
+    keyboard_buttons = [
+        [InlineKeyboardButton(text=cat, callback_data=f"cat_{i}")]
+        for i, cat in enumerate(categories)
+    ]
     keyboard_buttons.append([InlineKeyboardButton(text="🔙 Asosiy menyu", callback_data="back_home")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     await callback.message.answer("Ijtimoiy tarmoq yoki bo'limni tanlang:", reply_markup=keyboard)
@@ -153,31 +140,26 @@ async def show_categories(callback: types.CallbackQuery, state: FSMContext):
 
 
 @dp.callback_query(F.data == "back_home")
-async def back_home(callback: types.CallbackQuery, state: FSMContext):
-    await state.clear()
+async def back_home(callback: types.CallbackQuery):
     await callback.message.answer("Asosiy menyu:", reply_markup=main_menu_keyboard())
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("cat_"))
 async def show_services_in_category(callback: types.CallbackQuery):
-    cid = callback.data.removeprefix("cat_")
-    selected_cat = _category_lookup.get(cid)
-    if selected_cat is None:
-        await callback.answer("Kategoriya eskirgan, qaytadan tanlang.", show_alert=True)
+    idx = int(callback.data.replace("cat_", ""))
+    categories = dp.get("_categories", [])
+    if idx >= len(categories):
+        await callback.message.answer("Kategoriya topilmadi, qaytadan urinib ko'ring: /start")
+        await callback.answer()
         return
 
-    async with aiohttp.ClientSession() as session:
-        services = await fetch_services(session)
+    selected_cat = categories[idx]
+    services = get_custom_services()
 
-    keyboard_buttons = []
-    for s in services:
-        if s.get("category") == selected_cat:
-            s_id = s.get("service")
-            s_name = s.get("name", "Nomsiz xizmat")
-            s_rate = s.get("rate")
-            btn_text = f"{s_name[:25]} (1000 ta) — {s_rate} so'm"
-            keyboard_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"srv_{s_id}")])
+    keyboard_buttons = [
+        [service_button(s)] for s in services if s.get("category") == selected_cat
+    ]
 
     if not keyboard_buttons:
         await callback.message.answer("Bu bo'limda xizmatlar topilmadi.")
@@ -194,9 +176,9 @@ async def show_services_in_category(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "ai_search_prompt")
 async def ai_search_prompt(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer(
-        "🤖 AI yordamchi ishga tushdi!\n\n"
-        "Menga nima kerakligini yozing (masalan: 'Telegram obunachi' yoki 'Instagram like').\n"
-        "Bekor qilish uchun /cancel yozing.",
+        "🤖 *AI yordamchi ishga tushdi!*\n\n"
+        "Menga nima kerakligini yozing (masalan: _'Telegram obunachi'_ yoki _'Instagram like'_):",
+        parse_mode="Markdown",
     )
     await state.set_state(OrderState.waiting_for_search)
     await callback.answer()
@@ -205,52 +187,49 @@ async def ai_search_prompt(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(OrderState.waiting_for_search)
 async def process_ai_search(message: types.Message, state: FSMContext):
     user_query = message.text
-    async with aiohttp.ClientSession() as session:
-        services = await fetch_services(session)
+    services = get_custom_services()
 
     if not services:
         await message.answer("Hozirda xizmatlar ro'yxati bo'sh.")
         await state.clear()
         return
 
-    valid_ids = {s.get("service") for s in services}
     services_text = "\n".join(f"ID: {s.get('service')} | Nomi: {s.get('name')}" for s in services)
 
-    prompt = f"""Siz SMM xizmatlari botining yordamchisiz. Foydalanuvchi quyidagi xizmatni qidirmoqda: "{user_query}"
-Mavjud xizmatlar ro'yxatidan eng mos keladigan 3 tagacha xizmatni tanlang.
-Faqatgina mos keladigan xizmatlarning ID raqamlarini vergul bilan ajratib yozing (masalan: 974,125). Topilmasa 0 deb yozing. Boshqa hech qanday matn yozmang.
+    prompt = f"""
+    Siz SMM xizmatlari botining yordamchisiz. Foydalanuvchi quyidagi xizmatni qidirmoqda: "{user_query}"
+    Mavjud xizmatlar ro'yxatidan eng mos keladigan 3 tagacha xizmatni tanlang.
+    Faqatgina mos keladigan xizmatlarning ID raqamlarini vergul bilan ajratib yozing (masalan: 974,125). Topilmasa 0 deb yozing.
 
-Mavjud xizmatlar:
-{services_text}"""
+    Mavjud xizmatlar:
+    {services_text}
+    """
 
     try:
-        response = await asyncio.to_thread(
-            genai_client.models.generate_content,
+        response = genai_client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
         )
         ai_response = (response.text or "").strip()
 
-        found_ids = []
-        for word in ai_response.replace(",", " ").split():
-            if word.isdigit():
-                num = int(word)
-                if num in valid_ids:
-                    found_ids.append(num)
+        found_ids = [
+            int(word) for word in ai_response.replace(",", " ").split()
+            if word.isdigit() and int(word) > 0
+        ]
 
         if not found_ids:
             await message.answer("❌ Kechirasiz, bu so'rov bo'yicha hech narsa topilmadi. Kategoriyalardan foydalanib ko'ring.")
             await state.clear()
             return
 
-        keyboard_buttons = []
-        for s in services:
-            if s.get("service") in found_ids:
-                s_id = s.get("service")
-                s_name = s.get("name", "Nomsiz xizmat")
-                s_rate = s.get("rate")
-                btn_text = f"{s_name[:25]} (1000 ta) — {s_rate} so'm"
-                keyboard_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"srv_{s_id}")])
+        keyboard_buttons = [
+            [service_button(s)] for s in services if s.get("service") in found_ids
+        ]
+
+        if not keyboard_buttons:
+            await message.answer("❌ Kechirasiz, mos xizmat topilmadi. Kategoriyalardan foydalanib ko'ring.")
+            await state.clear()
+            return
 
         keyboard_buttons.append([InlineKeyboardButton(text="🔙 Asosiy menyu", callback_data="back_home")])
         keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
@@ -258,34 +237,35 @@ Mavjud xizmatlar:
         await message.answer("✨ AI siz uchun topgan xizmatlar va ularning narxlari:", reply_markup=keyboard)
         await state.clear()
 
-    except Exception:
-        logger.exception("AI qidiruv xatosi")
+    except Exception as e:
+        logging.error(f"AI xatosi: {e}")
         await message.answer("❌ Qidirishda xatolik yuz berdi. Iltimos, kategoriyalardan foydalaning.")
         await state.clear()
 
 
+# --- BUYURTMA JARAYONI ---
 @dp.callback_query(F.data.startswith("srv_"))
 async def select_service(callback: types.CallbackQuery, state: FSMContext):
     service_id = int(callback.data.split("_")[1])
+    service = get_service_by_id(service_id)
 
-    async with aiohttp.ClientSession() as session:
-        services = await fetch_services(session)
-    service = next((s for s in services if s.get("service") == service_id), None)
-
-    if service is None:
-        await callback.answer("Bu xizmat topilmadi, qaytadan tanlang.", show_alert=True)
+    if not service:
+        await callback.message.answer("Xizmat topilmadi, qaytadan urinib ko'ring: /start")
+        await callback.answer()
         return
 
-    await state.update_data(
-        service_id=service_id,
-        service_name=service.get("name", "Nomsiz xizmat"),
-        service_rate=service.get("rate"),
-        min_qty=int(service.get("min", 1) or 1),
-        max_qty=int(service.get("max", 1_000_000) or 1_000_000),
-    )
+    await state.update_data(service_id=service_id)
+
+    min_q = service.get("min", "—")
+    max_q = service.get("max", "—")
+    price = service.get("rate", 0)
 
     await callback.message.answer(
-        "Iltimos, kanal yoki sahifa havolasini (link) yuboring.\nBekor qilish uchun /cancel yozing.",
+        f"📦 *{service.get('name')}*\n"
+        f"💰 Narx: {price} so'm / 1000 ta\n"
+        f"📊 Min: {min_q}  |  Max: {max_q}\n\n"
+        "Iltimos, kanal yoki sahifa havolasini (link) yuboring:",
+        parse_mode="Markdown",
     )
     await state.set_state(OrderState.waiting_for_link)
     await callback.answer()
@@ -293,69 +273,84 @@ async def select_service(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(OrderState.waiting_for_link)
 async def process_link(message: types.Message, state: FSMContext):
-    link = (message.text or "").strip()
-    if not link.startswith(("http://", "https://", "@")):
-        await message.answer("Bu havolaga o'xshamayapti. Iltimos, to'liq link yuboring (https://... ko'rinishida).")
+    link = message.text.strip()
+    if not link.startswith("http"):
+        await message.answer("⚠️ Iltimos, to'g'ri havola (link) yuboring, masalan: https://...")
         return
 
     await state.update_data(link=link)
-    data = await state.get_data()
-    await message.answer(
-        f"Nechta miqdor kerakligini raqamda kiriting.\n"
-        f"Ruxsat etilgan oraliq: {data['min_qty']} – {data['max_qty']}"
-    )
+    await message.answer("Nechta miqdor kerakligini raqamda kiriting (masalan: `100`):", parse_mode="Markdown")
     await state.set_state(OrderState.waiting_for_quantity)
 
 
 @dp.message(OrderState.waiting_for_quantity)
 async def process_quantity(message: types.Message, state: FSMContext):
-    if not (message.text or "").isdigit():
-        await message.answer("Iltimos, faqat raqam kiriting!")
+    if not message.text.isdigit():
+        await message.answer("⚠️ Iltimos, faqat raqam kiriting!")
         return
 
     quantity = int(message.text)
     data = await state.get_data()
+    service = get_service_by_id(data.get("service_id"))
 
-    if not (data["min_qty"] <= quantity <= data["max_qty"]):
-        await message.answer(
-            f"Miqdor {data['min_qty']} dan {data['max_qty']} gacha bo'lishi kerak. Qaytadan kiriting:"
-        )
+    if not service:
+        await message.answer("Xizmat topilmadi. Qaytadan boshlang: /start")
+        await state.clear()
         return
 
-    est_price = round((data["service_rate"] or 0) * quantity / 1000, 2)
-    await state.update_data(quantity=quantity, est_price=est_price)
+    min_q = int(service.get("min", 0) or 0)
+    max_q = int(service.get("max", 0) or 0)
+
+    if min_q and quantity < min_q:
+        await message.answer(f"⚠️ Minimal miqdor: {min_q}. Iltimos, kattaroq son kiriting.")
+        return
+    if max_q and quantity > max_q:
+        await message.answer(f"⚠️ Maksimal miqdor: {max_q}. Iltimos, kichikroq son kiriting.")
+        return
+
+    price_per_1000 = float(service.get("rate", 0))
+    total_price = round(price_per_1000 * quantity / 1000, 2)
+
+    await state.update_data(quantity=quantity, total_price=total_price)
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="confirm_order")],
-            [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_order")],
+            [
+                InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="confirm_order"),
+                InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_order"),
+            ]
         ]
     )
     await message.answer(
-        "Buyurtmangizni tekshiring:\n\n"
-        f"Xizmat: {data['service_name']}\n"
-        f"Havola: {data['link']}\n"
+        f"🧾 *Buyurtma tafsilotlari:*\n"
         f"Miqdor: {quantity}\n"
-        f"Taxminiy narx: {est_price} so'm\n\n"
+        f"Jami narx: {total_price} so'm\n\n"
         "Tasdiqlaysizmi?",
         reply_markup=keyboard,
+        parse_mode="Markdown",
     )
     await state.set_state(OrderState.waiting_for_confirm)
 
 
-@dp.callback_query(OrderState.waiting_for_confirm, F.data == "cancel_order")
+@dp.callback_query(F.data == "cancel_order", OrderState.waiting_for_confirm)
 async def cancel_order(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.answer("❎ Buyurtma bekor qilindi.", reply_markup=main_menu_keyboard())
+    await callback.message.answer("❌ Buyurtma bekor qilindi.")
     await callback.answer()
 
 
-@dp.callback_query(OrderState.waiting_for_confirm, F.data == "confirm_order")
+@dp.callback_query(F.data == "confirm_order", OrderState.waiting_for_confirm)
 async def confirm_order(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
 
-    async with aiohttp.ClientSession() as session:
-        result = await create_topsmm_order(session, data["service_id"], data["link"], data["quantity"])
+    required = ("service_id", "link", "quantity")
+    if not all(k in data for k in required):
+        await callback.message.answer("⚠️ Ma'lumot yetarli emas. Qaytadan boshlang: /start")
+        await state.clear()
+        await callback.answer()
+        return
+
+    result = create_topsmm_order(data["service_id"], data["link"], data["quantity"])
 
     if result and isinstance(result, dict) and "order" in result:
         await callback.message.answer(f"✅ Buyurtma qabul qilindi! ID raqami: {result['order']}")
@@ -368,6 +363,7 @@ async def confirm_order(callback: types.CallbackQuery, state: FSMContext):
 
 
 async def main():
+    logging.info("Bot ishga tushmoqda...")
     await dp.start_polling(bot)
 
 
