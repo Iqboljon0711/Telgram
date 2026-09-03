@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import logging
 import os
 import time
@@ -353,15 +354,65 @@ async def ai_search_prompt(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-def prefilter_services(query: str, services: list, limit: int = 40) -> list:
+# O'zbekcha so'zlarni TopSMM'dagi odatiy ingliz/rus atamalariga moslashtirish uchun
+# kichik lug'at — lokal qidiruv ko'proq holatda to'g'ri ishlashi uchun.
+KEYWORD_SYNONYMS: dict[str, list[str]] = {
+    "obunachi": ["subscriber", "subscribers", "sub"],
+    "obuna": ["subscriber", "subscribers"],
+    "layk": ["like", "likes"],
+    "layklar": ["like", "likes"],
+    "kuzatuvchi": ["follower", "followers"],
+    "korish": ["view", "views"],
+    "korishlar": ["view", "views"],
+    "tomosha": ["view", "views"],
+    "azo": ["member", "members"],
+    "sharh": ["comment", "comments"],
+    "izoh": ["comment", "comments"],
+    "ulashish": ["share", "shares"],
+    "reaksiya": ["reaction", "reactions"],
+    "auditoriya": ["audience"],
+    "reklama": ["promotion", "promo"],
+}
+
+# Mashhur platforma nomlari — foydalanuvchi imlo xatosi bilan yozsa
+# ("Telgram", "Yutube") ham to'g'irlab olish uchun.
+KNOWN_PLATFORMS = [
+    "telegram", "instagram", "facebook", "tiktok", "youtube",
+    "twitter", "whatsapp", "vkontakte", "spotify", "threads",
+]
+
+
+def normalize_query_words(query: str) -> list[str]:
+    """So'rov so'zlarini tozalaydi, imlo xatolarini tuzatadi va sinonimlar
+    bilan kengaytiradi — lokal qidiruv ko'proq to'g'ri natija berishi uchun.
+    """
+    raw_words = [w.strip(".,!?'\u2019") for w in query.lower().split() if len(w.strip(".,!?'\u2019")) >= 2]
+    expanded: set[str] = set()
+    for w in raw_words:
+        expanded.add(w)
+        # Mashhur platforma nomiga imlosi yaqin bo'lsa, to'g'irlab qo'shamiz
+        close = difflib.get_close_matches(w, KNOWN_PLATFORMS, n=1, cutoff=0.72)
+        if close:
+            expanded.add(close[0])
+        if w in KEYWORD_SYNONYMS:
+            expanded.update(KEYWORD_SYNONYMS[w])
+    return list(expanded)
+
+
+def prefilter_services(query: str, services: list, limit: int = 40) -> tuple[list, bool]:
     """So'rov so'zlariga qarab xizmatlarni tez, lokal tarzda saralaydi.
 
     Bu Gemini'ga yuboriladigan matnni (va shu bilan javob vaqtini) sezilarli
     kamaytiradi — butun ro'yxat o'rniga faqat eng mos ~40 ta xizmat yuboriladi.
+
+    Ikkinchi qiymat — kamida bitta xizmat kalit so'z bo'yicha haqiqatan ham
+    mos kelganini bildiradi (True/False). Bu keyinchalik "ehtimoliy mos"
+    takliflarni faqat mazmunli bo'lganda ko'rsatish, va mos kelmasa Gemini'ga
+    kesilgan emas, TO'LIQ ro'yxatni yuborish uchun ishlatiladi.
     """
-    query_words = [w for w in query.lower().split() if len(w) >= 2]
+    query_words = normalize_query_words(query)
     if not query_words:
-        return services[:limit]
+        return services, False
 
     scored = []
     for s in services:
@@ -378,12 +429,14 @@ def prefilter_services(query: str, services: list, limit: int = 40) -> list:
             scored.append((score, s))
 
     if not scored:
-        # Hech narsa mos kelmasa, Gemini'ga baribir keng ro'yxat beramiz —
-        # to'liq bo'sh natija bermaslik uchun.
-        return services[:150]
+        # Kalit so'z bo'yicha hech narsa topilmadi (masalan tillar mos
+        # kelmadi) — Gemini'ga TO'LIQ ro'yxatni beramiz, chunki u
+        # semantik jihatdan tushunishi mumkin, faqat qisqartirilgan
+        # (tasodifiy) qism kerakli xizmatlarni chetlab o'tishi mumkin edi.
+        return services, False
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [s for _, s in scored[:limit]]
+    return [s for _, s in scored[:limit]], True
 
 
 @dp.message(OrderState.waiting_for_search)
@@ -400,11 +453,13 @@ async def process_ai_search(message: types.Message, state: FSMContext):
     valid_ids = {s.get("service") for s in services}
 
     # 1) Lokal tez filtrlash — Gemini'ga yuboriladigan hajmni kamaytiradi.
-    candidates = prefilter_services(user_query, services, limit=40)
+    candidates, had_local_match = prefilter_services(user_query, services, limit=40)
     services_text = "\n".join(f"ID: {s.get('service')} | Nomi: {s.get('name')}" for s in candidates)
 
     prompt = f"""Foydalanuvchi qidirmoqda: "{user_query}"
-Quyidagi ro'yxatdan eng mos 3 tagacha xizmatning ID raqamini vergul bilan yozing (masalan: 974,125). Mos kelmasa: 0. Boshqa hech narsa yozmang.
+Quyidagi ro'yxatdan eng mos 3 tagacha xizmatning ID raqamini vergul bilan yozing (masalan: 974,125).
+Aniq mos kelmasa ham, mavzu yoki maqsad jihatidan eng yaqin bo'lgan xizmatlarni ehtimollik sifatida taklif qiling —
+faqat ro'yxatda mutlaqo aloqador hech narsa bo'lmasagina 0 deb yozing. Boshqa hech narsa yozmang.
 
 {services_text}"""
 
@@ -423,7 +478,12 @@ Quyidagi ro'yxatdan eng mos 3 tagacha xizmatning ID raqamini vergul bilan yozing
                         contents=prompt,
                         config={
                             "temperature": 0,
-                            "max_output_tokens": 30,
+                            "max_output_tokens": 100,
+                            # Modelning ichki "thinking" bosqichini o'chiramiz —
+                            # aks holda u token byudjetini fikrlashga sarflab,
+                            # haqiqiy javobga (ID raqamlariga) ulgurmasligi
+                            # mumkin edi, natijada bo'sh javob qaytardi.
+                            "thinking_config": {"thinking_budget": 0},
                         },
                     ),
                     timeout=10,
@@ -451,10 +511,31 @@ Quyidagi ro'yxatdan eng mos 3 tagacha xizmatning ID raqamini vergul bilan yozing
                     found_ids.append(num)
 
         if not found_ids:
-            await message.answer(
-                "❌ Kechirasiz, bu so'rov bo'yicha hech narsa topilmadi. Kategoriyalardan foydalanib ko'ring.",
-                reply_markup=main_menu_keyboard(),
-            )
+            if had_local_match:
+                # AI aniq javob topa olmadi, lekin lokal saralashda
+                # kalit so'zga yaqin xizmatlar bor — shularni "ehtimol
+                # mos" sifatida taklif qilamiz, mutlaqo bo'sh javob
+                # o'rniga.
+                fallback_ids = [s.get("service") for s in candidates[:3]]
+                keyboard_buttons = []
+                for s in services:
+                    if s.get("service") in fallback_ids:
+                        s_id = s.get("service")
+                        s_name = s.get("name", "Nomsiz xizmat")
+                        s_rate = s.get("rate")
+                        btn_text = f"{s_name[:25]} (1000 ta) — {s_rate} so'm"
+                        keyboard_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"srv_{s_id}")])
+                keyboard_buttons.append([InlineKeyboardButton(text="🔙 Asosiy menyu", callback_data="back_home")])
+                keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+                await message.answer(
+                    "🤔 Aniq mos xizmat topilmadi, lekin so'rovingizga yaqin bo'lganlar shular bo'lishi mumkin:",
+                    reply_markup=keyboard,
+                )
+            else:
+                await message.answer(
+                    "❌ Kechirasiz, bu so'rov bo'yicha hech narsa topilmadi. Kategoriyalardan foydalanib ko'ring.",
+                    reply_markup=main_menu_keyboard(),
+                )
             await state.clear()
             return
 
