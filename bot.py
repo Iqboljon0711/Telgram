@@ -451,7 +451,10 @@ Quyidagi ro'yxatdan eng mos 3 tagacha xizmatning ID raqamini vergul bilan yozing
                     found_ids.append(num)
 
         if not found_ids:
-            await message.answer("❌ Kechirasiz, bu so'rov bo'yicha hech narsa topilmadi. Kategoriyalardan foydalanib ko'ring.")
+            await message.answer(
+                "❌ Kechirasiz, bu so'rov bo'yicha hech narsa topilmadi. Kategoriyalardan foydalanib ko'ring.",
+                reply_markup=main_menu_keyboard(),
+            )
             await state.clear()
             return
 
@@ -474,15 +477,20 @@ Quyidagi ro'yxatdan eng mos 3 tagacha xizmatning ID raqamini vergul bilan yozing
         logger.exception("AI qidiruv xatosi")
         if isinstance(e, asyncio.TimeoutError):
             await message.answer(
-                "⏳ AI javob berishga vaqt oldi. Iltimos, qaytadan urinib ko'ring yoki kategoriyalardan foydalaning."
+                "⏳ AI javob berishga vaqt oldi. Iltimos, qaytadan urinib ko'ring yoki kategoriyalardan foydalaning.",
+                reply_markup=main_menu_keyboard(),
             )
         elif "UNAVAILABLE" in str(e) or "503" in str(e):
             await message.answer(
                 "⏳ AI xizmati hozir band (Google tomonidan yuqori talab). "
-                "Birozdan so'ng qayta urinib ko'ring yoki kategoriyalardan foydalaning."
+                "Birozdan so'ng qayta urinib ko'ring yoki kategoriyalardan foydalaning.",
+                reply_markup=main_menu_keyboard(),
             )
         else:
-            await message.answer("❌ Qidirishda xatolik yuz berdi. Iltimos, kategoriyalardan foydalaning.")
+            await message.answer(
+                "❌ Qidirishda xatolik yuz berdi. Iltimos, kategoriyalardan foydalaning.",
+                reply_markup=main_menu_keyboard(),
+            )
         await state.clear()
 
 
@@ -627,6 +635,18 @@ async def confirm_order(callback: types.CallbackQuery, state: FSMContext):
 
     await state.clear()
     await callback.answer()
+
+
+# Yuqoridagi hech qaysi handlerga mos kelmagan har qanday xabar shu yerga
+# tushadi (masalan foydalanuvchi biror aktiv holatsiz erkin matn yozsa).
+# Botni "jim" qoldirmaslik va foydalanuvchini asosiy menyuga qaytarish uchun.
+@dp.message()
+async def fallback_message(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Kechirasiz, buni tushunmadim. Quyidagi menyudan foydalaning:",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 async def main():
