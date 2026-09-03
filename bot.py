@@ -292,15 +292,53 @@ async def show_categories(callback: types.CallbackQuery, state: FSMContext):
         return
 
     categories = sorted({s.get("category", "Boshqa") for s in services})
+    groups = group_categories_by_platform(categories)
+
+    # Platformalarni ma'lum tartibda, so'ng "Boshqa"ni oxirida ko'rsatamiz.
+    ordered_keys = [p for p in KNOWN_PLATFORMS if p in groups]
+    if OTHER_PLATFORM_KEY in groups:
+        ordered_keys.append(OTHER_PLATFORM_KEY)
+
     keyboard_buttons = []
-    for cat in categories:
+    for key in ordered_keys:
+        count = len(groups[key])
+        if key == OTHER_PLATFORM_KEY:
+            label = f"📦 Boshqa ({count})"
+        else:
+            emoji = PLATFORM_EMOJI.get(key, "📂")
+            label = f"{emoji} {key.capitalize()} ({count})"
+        keyboard_buttons.append([InlineKeyboardButton(text=label, callback_data=f"plat_{key}")])
+
+    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Asosiy menyu", callback_data="back_home")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    await callback.message.answer("Avval platformani tanlang:", reply_markup=keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("plat_"))
+async def show_categories_in_platform(callback: types.CallbackQuery):
+    platform_key = callback.data.removeprefix("plat_")
+
+    async with aiohttp.ClientSession() as session:
+        services = await fetch_services(session)
+
+    categories = sorted({s.get("category", "Boshqa") for s in services})
+    groups = group_categories_by_platform(categories)
+    cats = groups.get(platform_key, [])
+
+    if not cats:
+        await callback.answer("Bu platformada bo'limlar topilmadi.", show_alert=True)
+        return
+
+    keyboard_buttons = []
+    for cat in cats:
         cid = short_id(cat)
         _category_lookup[cid] = cat  # exact lookup, no truncation collisions
         keyboard_buttons.append([InlineKeyboardButton(text=cat[:40], callback_data=f"cat_{cid}")])
 
-    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Asosiy menyu", callback_data="back_home")])
+    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="show_categories")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    await callback.message.answer("Ijtimoiy tarmoq yoki bo'limni tanlang:", reply_markup=keyboard)
+    await callback.message.answer("Bo'limni tanlang:", reply_markup=keyboard)
     await callback.answer()
 
 
@@ -380,6 +418,29 @@ KNOWN_PLATFORMS = [
     "telegram", "instagram", "facebook", "tiktok", "youtube",
     "twitter", "whatsapp", "vkontakte", "spotify", "threads",
 ]
+
+PLATFORM_EMOJI = {
+    "telegram": "📱", "instagram": "📸", "facebook": "📘", "tiktok": "🎵",
+    "youtube": "▶️", "twitter": "🐦", "whatsapp": "💬", "vkontakte": "🌐",
+    "spotify": "🎧", "threads": "🧵",
+}
+OTHER_PLATFORM_KEY = "boshqa"
+
+
+def group_categories_by_platform(categories: list) -> dict:
+    """Kategoriyalarni platforma nomi bo'yicha guruhlaydi (Telegram, Instagram,
+    TikTok, ...). Hech qaysi platformaga mos kelmagan kategoriyalar "Boshqa"
+    guruhiga tushadi. Bu "Kategoriyalar" bo'limini bosqichma-bosqich, qidirish
+    uchun qulayroq qiladi — foydalanuvchi o'nlab kategoriya o'rniga avval
+    platformani, keyin o'sha platformaning bo'limlarini tanlaydi.
+    """
+    groups: dict = {}
+    for cat in categories:
+        cat_lower = cat.lower()
+        matched = next((p for p in KNOWN_PLATFORMS if p in cat_lower), None)
+        key = matched or OTHER_PLATFORM_KEY
+        groups.setdefault(key, []).append(cat)
+    return groups
 
 
 def normalize_query_words(query: str) -> list[str]:
