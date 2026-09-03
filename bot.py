@@ -1,5 +1,6 @@
 import asyncio
 import difflib
+import html
 import logging
 import os
 import time
@@ -30,6 +31,7 @@ MARKUP_MULTIPLIER = float(os.environ.get("MARKUP_MULTIPLIER", "1.25"))
 # future Google renaming doesn't require editing this file again.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
 SERVICES_CACHE_TTL = 300  # seconds
+PAGE_SIZE = 8  # bitta xabarda ko'rsatiladigan tugmalar soni (sahifalash uchun)
 
 # TopSMM narxlari RUB da qaytadi. Fix kurs bilan so'mga o'giramiz.
 # Kursni yangilash uchun .env dagi RUB_TO_UZS_RATE ni tahrirlang.
@@ -70,6 +72,31 @@ def short_id(text: str) -> str:
     return format(zlib.crc32(text.encode("utf-8")) & 0xFFFFFFFF, "x")
 
 
+def paginate_list(items: list, page: int, page_size: int = PAGE_SIZE) -> tuple[list, int, int]:
+    """Ro'yxatni sahifalarga bo'ladi. (shu sahifadagi elementlar, tozalangan
+    sahifa raqami, jami sahifalar soni) qaytaradi.
+    """
+    total_pages = max(1, (len(items) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    return items[start:start + page_size], page, total_pages
+
+
+def add_pagination_row(keyboard_buttons: list, page: int, total_pages: int, callback_prefix: str) -> None:
+    """Kerak bo'lsa 'Oldingi/Keyingi' qatorini qo'shadi. callback_prefix
+    oxiriga sahifa raqami qo'shib to'liq callback_data hosil qilinadi.
+    """
+    if total_pages <= 1:
+        return
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️ Oldingi", callback_data=f"{callback_prefix}{page - 1}"))
+    nav_row.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="Keyingi ▶️", callback_data=f"{callback_prefix}{page + 1}"))
+    keyboard_buttons.append(nav_row)
+
+
 def get_balance(user_id: int) -> float:
     return _user_balances.get(user_id, 0.0)
 
@@ -102,6 +129,11 @@ async def fetch_services(session: aiohttp.ClientSession, force: bool = False) ->
             base_rate_rub = 0.0
         # RUB -> UZS, keyin markup qo'shiladi. Natija "1000 ta narxi, so'm".
         service["rate"] = round(base_rate_rub * RUB_TO_UZS_RATE * MARKUP_MULTIPLIER, 2)
+        # TopSMM ba'zan nomlarni HTML-kodlangan holda qaytaradi (masalan
+        # "O&#039;zbek" -> "O'zbek"). Shuni bir marta shu yerda tozalab
+        # qo'yamiz, tugmalarda to'g'ri ko'rinishi uchun.
+        service["name"] = html.unescape(str(service.get("name", "")))
+        service["category"] = html.unescape(str(service.get("category", "Boshqa")))
 
     _services_cache["data"] = services
     _services_cache["fetched_at"] = now
@@ -323,22 +355,74 @@ async def show_categories_in_platform(callback: types.CallbackQuery):
         services = await fetch_services(session)
 
     categories = sorted({s.get("category", "Boshqa") for s in services})
-    groups = group_categories_by_platform(categories)
-    cats = groups.get(platform_key, [])
+    platform_groups = group_categories_by_platform(categories)
+    cats = platform_groups.get(platform_key, [])
 
     if not cats:
         await callback.answer("Bu platformada bo'limlar topilmadi.", show_alert=True)
         return
 
+    type_groups = group_categories_by_type(cats)
+    ordered_type_keys = [t for t in TYPE_KEYWORDS if t in type_groups]
+    if OTHER_TYPE_KEY in type_groups:
+        ordered_type_keys.append(OTHER_TYPE_KEY)
+
     keyboard_buttons = []
-    for cat in cats:
-        cid = short_id(cat)
-        _category_lookup[cid] = cat  # exact lookup, no truncation collisions
-        keyboard_buttons.append([InlineKeyboardButton(text=cat[:40], callback_data=f"cat_{cid}")])
+    for turi in ordered_type_keys:
+        count = len(type_groups[turi])
+        if turi == OTHER_TYPE_KEY:
+            label = f"📦 Boshqa ({count})"
+        else:
+            emoji = TYPE_EMOJI.get(turi, "🔹")
+            label = f"{emoji} {turi.capitalize()} ({count})"
+        keyboard_buttons.append([InlineKeyboardButton(text=label, callback_data=f"type_{platform_key}_{turi}_0")])
 
     keyboard_buttons.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="show_categories")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    await callback.message.answer("Endi xizmat turini tanlang:", reply_markup=keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("type_"))
+async def show_categories_in_type(callback: types.CallbackQuery):
+    # callback_data: type_<platform_key>_<turi>_<page>
+    payload = callback.data.removeprefix("type_")
+    base, _, page_str = payload.rpartition("_")
+    page = int(page_str) if page_str.isdigit() else 0
+    platform_key, _, turi = base.partition("_")
+
+    async with aiohttp.ClientSession() as session:
+        services = await fetch_services(session)
+
+    categories = sorted({s.get("category", "Boshqa") for s in services})
+    platform_groups = group_categories_by_platform(categories)
+    cats = platform_groups.get(platform_key, [])
+    type_groups = group_categories_by_type(cats)
+    final_cats = type_groups.get(turi, [])
+
+    if not final_cats:
+        await callback.answer("Bu bo'limda kategoriya topilmadi.", show_alert=True)
+        return
+
+    page_cats, page, total_pages = paginate_list(final_cats, page)
+
+    keyboard_buttons = []
+    for cat in page_cats:
+        cid = short_id(cat)
+        _category_lookup[cid] = cat  # exact lookup, no truncation collisions
+        keyboard_buttons.append([InlineKeyboardButton(text=cat[:40], callback_data=f"cat_{cid}_0")])
+
+    add_pagination_row(keyboard_buttons, page, total_pages, f"type_{platform_key}_{turi}_")
+
+    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data=f"plat_{platform_key}")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     await callback.message.answer("Bo'limni tanlang:", reply_markup=keyboard)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "noop")
+async def noop_callback(callback: types.CallbackQuery):
+    # Sahifa raqami ko'rsatkichi tugmasi — bosilganda hech narsa qilmaydi.
     await callback.answer()
 
 
@@ -351,7 +435,11 @@ async def back_home(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("cat_"))
 async def show_services_in_category(callback: types.CallbackQuery):
-    cid = callback.data.removeprefix("cat_")
+    # callback_data: cat_<cid>_<page>
+    payload = callback.data.removeprefix("cat_")
+    cid, _, page_str = payload.rpartition("_")
+    page = int(page_str) if page_str.isdigit() else 0
+
     selected_cat = _category_lookup.get(cid)
     if selected_cat is None:
         await callback.answer("Kategoriya eskirgan, qaytadan tanlang.", show_alert=True)
@@ -360,19 +448,24 @@ async def show_services_in_category(callback: types.CallbackQuery):
     async with aiohttp.ClientSession() as session:
         services = await fetch_services(session)
 
-    keyboard_buttons = []
-    for s in services:
-        if s.get("category") == selected_cat:
-            s_id = s.get("service")
-            s_name = s.get("name", "Nomsiz xizmat")
-            s_rate = s.get("rate")
-            btn_text = f"{s_name[:25]} (1000 ta) — {s_rate} so'm"
-            keyboard_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"srv_{s_id}")])
+    matching_services = [s for s in services if s.get("category") == selected_cat]
 
-    if not keyboard_buttons:
+    if not matching_services:
         await callback.message.answer("Bu bo'limda xizmatlar topilmadi.")
         await callback.answer()
         return
+
+    page_services, page, total_pages = paginate_list(matching_services, page)
+
+    keyboard_buttons = []
+    for s in page_services:
+        s_id = s.get("service")
+        s_name = s.get("name", "Nomsiz xizmat")
+        s_rate = s.get("rate")
+        btn_text = f"{s_name[:25]} (1000 ta) — {s_rate} so'm"
+        keyboard_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"srv_{s_id}")])
+
+    add_pagination_row(keyboard_buttons, page, total_pages, f"cat_{cid}_")
 
     keyboard_buttons.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="show_categories")])
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
@@ -439,6 +532,40 @@ def group_categories_by_platform(categories: list) -> dict:
         cat_lower = cat.lower()
         matched = next((p for p in KNOWN_PLATFORMS if p in cat_lower), None)
         key = matched or OTHER_PLATFORM_KEY
+        groups.setdefault(key, []).append(cat)
+    return groups
+
+
+# Kategoriyani xizmat "turi" bo'yicha ham guruhlash uchun (obunachi, layk,
+# ko'rish, izoh, ulashish, reaksiya, a'zo, kuzatuvchi). Platforma tanlangach,
+# bu bosqich ro'yxatni yana kichraytirib, qidirishni osonlashtiradi.
+TYPE_KEYWORDS: dict = {
+    "obunachi": ["subscriber", "subscribers", "sub"],
+    "layk": ["like", "likes"],
+    "korish": ["view", "views"],
+    "izoh": ["comment", "comments"],
+    "ulashish": ["share", "shares"],
+    "reaksiya": ["reaction", "reactions"],
+    "azo": ["member", "members"],
+    "kuzatuvchi": ["follower", "followers"],
+}
+TYPE_EMOJI = {
+    "obunachi": "👥", "layk": "❤️", "korish": "👁", "izoh": "💬",
+    "ulashish": "🔁", "reaksiya": "⭐", "azo": "🧑‍🤝‍🧑", "kuzatuvchi": "➕",
+}
+OTHER_TYPE_KEY = "boshqaturi"
+
+
+def group_categories_by_type(categories: list) -> dict:
+    """Berilgan kategoriyalar ro'yxatini xizmat turi bo'yicha guruhlaydi."""
+    groups: dict = {}
+    for cat in categories:
+        cat_lower = cat.lower()
+        matched = next(
+            (turi for turi, keywords in TYPE_KEYWORDS.items() if any(k in cat_lower for k in keywords)),
+            None,
+        )
+        key = matched or OTHER_TYPE_KEY
         groups.setdefault(key, []).append(cat)
     return groups
 
